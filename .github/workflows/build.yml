@@ -1,67 +1,110 @@
 name: 'Build'
+
 on:
   push:
   workflow_dispatch:
-  schedule:
-    - cron: '30 0 * * *'
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+
   build:
-    name: build
-    runs-on: windows-2019
+    runs-on: ${{ matrix.os }}-latest
     strategy:
       fail-fast: false
       matrix:
-        php: ['8.0', '8.1', '8.2', '8.3', '8.4']
-        extensions: [pcov, xdebug]
-        sdk_version: [master]
-        vs: [vs16]
-        ts: [ts, nts]
-        arch: [x64, x86]
-        include:
-          - extensions: pcov
-            repo: krakjoe/pcov
-            branch: release
-            dev_branch: develop
-            args: enable-pcov
-          - extensions: xdebug
-            repo: xdebug/xdebug
-            branch: master
-            dev_branch: master
-            args: with-xdebug
+        os: [ ubuntu, macos ]
+        php: ['8.0', '8.1', '8.2', '8.3']
+
     steps:
-    - uses: actions/checkout@v3
-    - name: build
-      run: |
-        pwsh scripts/builder.ps1 ${{ matrix.extensions }} ${{ matrix.repo }} ${{ matrix.branch }} ${{ matrix.dev_branch }} ${{ matrix.args }} ${{ matrix.sdk_version }} ${{ matrix.vs }} ${{ matrix.arch }} ${{ matrix.ts }} ${{ matrix.php }}
-        $exit_code = $?
-        if(-not($exit_code)) {
-          exit $exit_code
-        }
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v2
-      with:
-        name: ${{ matrix.extensions }}_${{ matrix.ts }}_${{ matrix.arch }}
-        path: ${{ matrix.extensions }}
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          extensions: none, grpc
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: none
+      - name: Store Extension Dir
+        run: echo "GRPC_EXTENSION_PATH=$(php-config --extension-dir)/grpc.so" >> $GITHUB_ENV
+        shell: bash
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}_php${{ matrix.php }}_x64
+          path: ${{ env.GRPC_EXTENSION_PATH }}
+
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.0', '8.1', '8.2', '8.3']
+        grpc: ['1.61.0']
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Setup PHP SDK
+        id: setup-php-sdk
+        uses: php/setup-php-sdk@v0.8
+        with:
+          version: ${{ matrix.php }}
+          arch: x64
+          ts: nts
+      - name: Setup Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: ${{steps.setup-php-sdk.outputs.toolset}}
+      - name: Download GRPC Archive
+        uses: suisei-cn/actions-download-file@v1.4.0
+        with:
+          url: "https://pecl.php.net/get/grpc-${{ matrix.grpc }}.tgz"
+          target: ./
+      - name: Extract GRPC Archive
+        uses: ihiroky/extract-action@v1
+        with:
+          file_path: grpc-${{ matrix.grpc }}.tgz
+          extract_dir: .
+      - name: Move GRPC
+        run: Move-Item -Path grpc-${{ matrix.grpc }} -Destination C:\
+      - name: Rename GRPC
+        run: Rename-Item -Path C:\grpc-${{ matrix.grpc }} -NewName grpc
+      - name: Compile GRPC
+        run: |
+          curl https://gist.githubusercontent.com/tienvx/1ee366b4a2c64aea48f90db3ca3b8df4/raw/3ab0ef942cbb3bb143b5d037475f08b7ee8f973f/compile-grpc-windows.patch | git apply -v
+          ${{steps.setup-php-sdk.outputs.prefix}}\..\php-dev\phpize.bat
+          .\configure.bat --help
+          .\configure.bat --with-grpc --with-mp=auto
+          nmake
+        working-directory: C:\grpc
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows_php${{ matrix.php }}_x64
+          path: C:\grpc\x64\Release\php_grpc.dll
   release:
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, build-windows]
     steps:
-    - uses: actions/checkout@v3
-    - run: mkdir ext
-    - uses: actions/download-artifact@v2
-      with:
-        path: ext
-    - name: Release
-      run: |
-        set -x
-        assets=()
-        for asset in ./ext/*/*.dll; do
-          assets+=("$asset")
-        done
-        if ! gh release view builds; then
-          gh release create "builds" "${assets[@]}" -t "builds" -n "builds"
-        else
-          gh release upload "builds" "${assets[@]}" --clobber
-        fi
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v3
+      - run: mkdir ext
+      - uses: actions/download-artifact@v4
+        with:
+          path: ext
+      - name: Release
+        run: |
+          set -x
+          assets=()
+          for asset in ./ext/*/*.{dll,so}; do
+            assets+=("$asset")
+          done
+          if ! gh release view builds; then
+            gh release create "builds" "${assets[@]}" -t "builds" -n "builds"
+          else
+            gh release upload "builds" "${assets[@]}" --clobber
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
